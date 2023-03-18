@@ -48,6 +48,7 @@ find_package(MPI REQUIRED)
 find_package(Threads)
 
 set(CUDA_SEPARABLE_COMPILATION ON)
+# set(CMAKE_EXPORT_COMPILE_COMMANDS OFF)
 
 # whether use nvtx
 option(USE_NVTX "Use nvtx for profiling" OFF)

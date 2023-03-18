@@ -21,8 +21,9 @@ import sys
 
 sys.path.append("../")
 import utility
-from utility import sparse_operation_kit as sok
+import sparse_operation_kit as sok
 import nvtx
+import time
 
 
 def main(args):
@@ -86,12 +87,14 @@ def main(args):
             break
 
         rng = nvtx.start_range(message="Iteration_" + str(i), color="blue")
-
+        
+        start = time.clock_gettime(time.CLOCK_MONOTONIC)
         replica_loss = strategy.run(_train_step, args=(inputs, labels))
         loss = strategy.reduce(tf.distribute.ReduceOp.SUM, replica_loss, axis=None)
+        end = time.clock_gettime(time.CLOCK_MONOTONIC)
 
         nvtx.end_range(rng)
-        print("[INFO]: Iteration: {}, loss={}".format(i, loss))
+        print("[INFO]: Iteration: {}, loss={:.10f}, time={:.10f}".format(i, loss, end - start))
 
 
 if __name__ == "__main__":

@@ -166,6 +166,7 @@ class SOKDenseDemo(tf.keras.models.Model):
             embedding_vec_size=self.embedding_vec_size,
             slot_num=self.slot_num,
             nnz_per_slot=self.nnz_per_slot,
+            use_hashtable=False
         )
 
         self.dense_layers = []
