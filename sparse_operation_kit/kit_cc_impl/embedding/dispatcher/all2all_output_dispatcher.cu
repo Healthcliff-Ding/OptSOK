@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "common.h"
 #include "common/include/forward_functions.h"
 #include "operation/operation_interface.h"
 
@@ -101,26 +100,6 @@ __global__ void gatherExKernel(const size_t EmbeddingDimension, EmbeddingType co
   }
 }
 
-template <typename EmbeddingType>
-__global__ static void scatterGradKernel(const size_t EmbeddingDimension, EmbeddingType const *top_grad,
-                                  uint32_t const *top_indices, EmbeddingType **replica_grad, 
-                                  size_t chunks, size_t max_chunk_size, 
-                                  uint32_t const *top_select_size, uint32_t const *replica_recv_offset) {
-  uint32_t gpu_idx = blockIdx.y;
-  uint32_t curr_chunk_size = top_select_size[gpu_idx];
-  uint32_t const *curr_input_idx = top_indices + gpu_idx * max_chunk_size;
-  EmbeddingType *curr_output = replica_grad[gpu_idx] + replica_recv_offset[gpu_idx] * EmbeddingDimension;
-
-  for (size_t id = blockIdx.x * blockDim.x + threadIdx.x; id < curr_chunk_size * EmbeddingDimension;
-       id += blockDim.x * gridDim.x) {
-    size_t item_id = id / EmbeddingDimension;
-    size_t embedding_id = id - item_id * EmbeddingDimension;
-
-    size_t index = curr_input_idx[item_id];
-    curr_output[id] = top_grad[index * EmbeddingDimension + embedding_id];
-  }
-}
-
 template <typename ValueType>
 class All2AllOutputDispatcher : public Dispatcher {
  public:
@@ -130,12 +109,23 @@ class All2AllOutputDispatcher : public Dispatcher {
         num_keys_per_rank_(base_context()->get_replica_batch_size() *
                            base_context()->get_slot_num() * base_context()->get_nnz_per_slot()) {
     const size_t local_gpu_count = resource_mgr_->get_local_gpu_count();
-    h_replica_input_grad_ptr_.reserve(local_gpu_count);
-    h_replica_recv_chunk_offset_.reserve(local_gpu_count);
+    exchanged_embeddings_buf_.reserve(local_gpu_count);
+    gathered_gradients_buf_.reserve(local_gpu_count);
   }
 
-  void allocate_forward_spaces() override {}
-
+  void allocate_forward_spaces() override {
+    const size_t local_gpu_count = resource_mgr_->get_local_gpu_count();
+    const size_t global_gpu_count = resource_mgr_->get_global_gpu_count();
+    const size_t embedding_vec_size = base_context()->get_param()->get_embedding_vec_size();
+    for (size_t dev_id = 0; dev_id < local_gpu_count; dev_id++) {
+      auto &buffer = base_context()->get_buffer(dev_id);
+      {
+        Tensor2<ValueType> tensor;
+        buffer->reserve({global_gpu_count, embedding_vec_size * num_keys_per_rank_}, &tensor);
+        exchanged_embeddings_buf_.push_back(tensor);
+      }
+    }  // for dev_id in local_gpu_count
+  }
 
   void allocate_backward_spaces() override {
     const size_t local_gpu_count = resource_mgr_->get_local_gpu_count();
@@ -143,21 +133,69 @@ class All2AllOutputDispatcher : public Dispatcher {
     const size_t embedding_vec_size = base_context()->get_param()->get_embedding_vec_size();
     for (size_t dev_id = 0; dev_id < local_gpu_count; dev_id++) {
       auto &buffer = base_context()->get_buffer(dev_id);
-      auto &host_buffer = base_context()->get_host_buffer(dev_id);
+
       {
-        Tensor2<ValueType*> tensor;
-        host_buffer->reserve({global_gpu_count}, &tensor);
-        h_replica_input_grad_ptr_.push_back(tensor);
-      }
-      {
-        Tensor2<uint32_t> tensor;
-        host_buffer->reserve({global_gpu_count}, &tensor);
-        h_replica_recv_chunk_offset_.push_back(tensor);
+        Tensor2<ValueType> tensor;  // FIXME: check whether top-grad is fp32 or fp16
+        buffer->reserve({global_gpu_count, embedding_vec_size * num_keys_per_rank_}, &tensor);
+        gathered_gradients_buf_.push_back(tensor);
       }
     }  // for dev_id in local_gpu_count
   }
 
-  void forward(const Context_t &replica_context, const bool training) override {}
+  void forward(const Context_t &replica_context, const bool training) override {
+    const size_t global_gpu_count = resource_mgr_->get_global_gpu_count();
+    const size_t global_replica_id = replica_context->get_global_replica_id();
+    const size_t local_replica_id = resource_mgr_->cal_local_id_from_global_id(global_replica_id);
+    const auto &local_gpu = resource_mgr_->get_local_gpu(local_replica_id);
+
+    const auto &replica_gathered_embeddings = replica_context->input("replica_gathered_embeddings");
+    const auto &h_recv_chunk_offsets = replica_context->input("replica_h_recv_chunk_offsets");
+    const auto &h_num_exchanged_keys = replica_context->input("replica_h_num_exchanged_keys");
+    const auto &h_num_selected_keys = replica_context->input("replica_h_num_selected_keys");
+    const auto &replica_num_selected_keys = replica_context->input("replica_num_selected_keys");
+    const auto &replica_selected_indices_buf =
+        replica_context->input("replica_selected_indices_buf");
+
+    auto &replica_output = replica_context->output("replica_output");
+    // step 1: exchange embedding values among all GPUs.
+    const size_t embedding_vec_size = base_context()->get_param()->get_embedding_vec_size();
+    CK_NCCL(ncclGroupStart());
+    for (size_t dev_id = 0; dev_id < global_gpu_count; dev_id++) {
+      CK_NCCL(ncclSend(
+          replica_gathered_embeddings->GetPtrWithType<ValueType>() +
+              h_recv_chunk_offsets->GetPtrWithType<uint32_t>()[dev_id] * embedding_vec_size,
+          h_num_exchanged_keys->GetPtrWithType<uint32_t>()[dev_id] * embedding_vec_size,
+          GetNCCLType<ValueType>(), /*peer=*/dev_id, local_gpu->get_nccl(),
+          local_gpu->get_stream()));
+      CK_NCCL(ncclRecv(exchanged_embeddings_buf_[local_replica_id].get_ptr() +
+                           dev_id * num_keys_per_rank_ * embedding_vec_size,
+                       h_num_selected_keys->GetPtrWithType<uint32_t>()[dev_id] * embedding_vec_size,
+                       GetNCCLType<ValueType>(), /*peer=*/dev_id, local_gpu->get_nccl(),
+                       local_gpu->get_stream()));
+    }  // for dev_id in global_gpu_count
+    CK_NCCL(ncclGroupEnd());
+
+    // step 2: reorder embedding values
+    {
+      // CK_CUDA(cudaMemsetAsync(replica_output->GetPtrWithType<float>(), 0,
+      //                         replica_output->get_size_in_bytes(),
+      //                         local_gpu->get_stream()));  // TODO: merge it to reorderKernel
+      const size_t smem_size = local_gpu->get_max_smem_size_per_sm() / 2;
+      CK_CUDA(cudaFuncSetAttribute(reorderKernel<ValueType>,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      dim3 const grid_dim(2 * local_gpu->get_sm_count() / global_gpu_count, global_gpu_count);
+      dim3 const block_dim(local_gpu->get_warp_size(), EMB_WARPS_PER_BLOCK);
+      reorderKernel<ValueType><<<grid_dim, block_dim, smem_size, local_gpu->get_stream()>>>(
+          /*EmbeddingDimension=*/embedding_vec_size,
+          /*inputs=*/exchanged_embeddings_buf_[local_replica_id].get_ptr(),
+          /*indices=*/replica_selected_indices_buf->GetPtrWithType<uint32_t>(),
+          /*outputs=*/replica_output->GetPtrWithType<ValueType>(),
+          /*chunks=*/global_gpu_count,
+          /*max_chunk_size=*/num_keys_per_rank_,
+          /*chunk_sizes=*/replica_num_selected_keys->GetPtrWithType<uint32_t>());
+      CK_CUDA(cudaGetLastError());
+    }
+  }
 
   void backward(const Context_t &replica_context) override {
     const size_t global_gpu_count = resource_mgr_->get_global_gpu_count();
@@ -176,34 +214,41 @@ class All2AllOutputDispatcher : public Dispatcher {
 
     auto &replica_input_grad = replica_context->output("replica_input_grad");
 
+    // step 1: gather top gradients for local GPU.
     const size_t embedding_vec_size = base_context()->get_param()->get_embedding_vec_size();
-
-    //* step 1: issue gradient directly to where it ought to be
-    //! assume local_gpu_cnt == global_gpu_cnt 
-    //  use CPU thread to gather each peer's ptr
-    for (size_t dev_id = 0; dev_id < global_gpu_count; dev_id++) {
-      h_replica_input_grad_ptr_[dev_id].get_ptr()[local_replica_id] = 
-        replica_input_grad->GetPtrWithType<ValueType>();
-      h_replica_recv_chunk_offset_[dev_id].get_ptr()[local_replica_id] =
-        replica_h_recv_chunk_offsets->GetPtrWithType<uint32_t>()[dev_id];
-    }
-    resource_mgr_->sync_cpu_threads();
-    //* WRITE style synchronize
     {
+      const size_t smem_size = local_gpu->get_max_smem_size_per_sm() / 2;
+      CK_CUDA(cudaFuncSetAttribute(gatherExKernel<ValueType>,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       dim3 const grid_dim(2 * local_gpu->get_sm_count() / global_gpu_count, global_gpu_count);
-      scatterGradKernel<ValueType><<<grid_dim, 1024ul, 0, local_gpu->get_stream()>>>(
-        embedding_vec_size, 
-        replica_top_gradients->GetPtrWithType<ValueType>(),
-        replica_selected_indices_buf->GetPtrWithType<uint32_t>(),
-        h_replica_input_grad_ptr_[local_replica_id].get_ptr(),
-        global_gpu_count,
-        num_keys_per_rank_,
-        replica_num_selected_keys->GetPtrWithType<uint32_t>(),
-        h_replica_recv_chunk_offset_[local_replica_id].get_ptr());
-      CK_CUDA(cudaGetLastError());  
+      dim3 const block_dim(local_gpu->get_warp_size(), EMB_WARPS_PER_BLOCK);
+      gatherExKernel<ValueType><<<grid_dim, block_dim, smem_size, local_gpu->get_stream()>>>(
+          /*EmbeddingDimension=*/embedding_vec_size,
+          /*inputs=*/replica_top_gradients->GetPtrWithType<ValueType>(),
+          /*indices=*/replica_selected_indices_buf->GetPtrWithType<uint32_t>(),
+          /*outputs=*/gathered_gradients_buf_[local_replica_id].get_ptr(),
+          /*chunks=*/global_gpu_count,
+          /*max_chunk_size=*/num_keys_per_rank_,
+          /*chunk_sizes=*/replica_num_selected_keys->GetPtrWithType<uint32_t>());
+      CK_CUDA(cudaGetLastError());
     }
-    CK_CUDA(cudaStreamSynchronize(local_gpu->get_stream()));
-    resource_mgr_->sync_cpu_threads();
+
+    // step 2: exchange gradients among all GPUs.
+    CK_NCCL(ncclGroupStart());
+    for (size_t dev_id = 0; dev_id < global_gpu_count; dev_id++) {
+      CK_NCCL(ncclSend(gathered_gradients_buf_[local_replica_id].get_ptr() +
+                           dev_id * num_keys_per_rank_ * embedding_vec_size,
+                       h_num_selected_keys->GetPtrWithType<uint32_t>()[dev_id] * embedding_vec_size,
+                       GetNCCLType<ValueType>(), /*peer=*/dev_id, local_gpu->get_nccl(),
+                       local_gpu->get_stream()));
+      CK_NCCL(ncclRecv(
+          replica_input_grad->GetPtrWithType<ValueType>() +
+              replica_h_recv_chunk_offsets->GetPtrWithType<uint32_t>()[dev_id] * embedding_vec_size,
+          h_num_exchanged_keys->GetPtrWithType<uint32_t>()[dev_id] * embedding_vec_size,
+          GetNCCLType<ValueType>(), /*peer=*/dev_id, local_gpu->get_nccl(),
+          local_gpu->get_stream()));
+    }  // for dev_id in global_gpu_count
+    CK_NCCL(ncclGroupEnd());
   }
 
  private:
@@ -211,10 +256,10 @@ class All2AllOutputDispatcher : public Dispatcher {
   const size_t num_keys_per_rank_;
 
   // forward spaces
+  Tensors2<ValueType> exchanged_embeddings_buf_;
 
   // backward spaces
-  Tensors2<ValueType*> h_replica_input_grad_ptr_;
-  Tensors2<uint32_t> h_replica_recv_chunk_offset_;
+  Tensors2<ValueType> gathered_gradients_buf_;
 };
 
 REGISTER_OUTPUT_DISPATHER_BUILDER("All2AllOutput", DataType::Int64, DataType::Float32,

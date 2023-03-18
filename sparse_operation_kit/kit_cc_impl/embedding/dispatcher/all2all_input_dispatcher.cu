@@ -14,17 +14,10 @@
  * limitations under the License.
  */
 
-#include <cstddef>
-#include <cstdint>
-#include <iostream>
-#include <string>
-#include "common.h"
 #include "common/include/forward_functions.h"
 #include "operation/operation_interface.h"
 
 namespace SparseOperationKit {
-
-//! Move IdenticalHash to commom/include/forward_functions
 
 /*It will dispatcher keys based on key % GPU_NUM */
 template <typename KeyType, typename Hasher>
@@ -240,18 +233,14 @@ class All2AllInputDispatcher : public Dispatcher {
     }
 
     // step 3: exchange selected keys count among all GPUs
-    //* replace NCCL with P2P Direct
-    //! assume global_gpu_id == local_gpu_id
+    CK_NCCL(ncclGroupStart());
     for (size_t dev_id = 0; dev_id < global_gpu_count; dev_id++) {
-      CK_CUDA(cudaMemcpyAsync(num_exchanged_keys_[dev_id].get_ptr() + local_replica_id, 
-                              num_selected_keys_[local_replica_id].get_ptr() + dev_id, 
-                              sizeof(uint32_t), cudaMemcpyDefault,
-                              local_gpu->get_stream()));
-    }
-    CK_CUDA(cudaStreamSynchronize(local_gpu->get_stream()));
-    //* synchronize local CPU threads
-    //  wait for other gpus complete write
-    resource_mgr_->sync_cpu_threads();
+      CK_NCCL(ncclSend(num_selected_keys_[local_replica_id].get_ptr() + dev_id, 1, ncclUint32,
+                       /*peer=*/dev_id, local_gpu->get_nccl(), local_gpu->get_stream()));
+      CK_NCCL(ncclRecv(num_exchanged_keys_[local_replica_id].get_ptr() + dev_id, 1, ncclUint32,
+                       /*peer=*/dev_id, local_gpu->get_nccl(), local_gpu->get_stream()));
+    }  // for dev_id in global_gpu_count
+    CK_NCCL(ncclGroupEnd());
 
     // step 4: copy count from GPU to CPU and calculate count offsets
     CK_CUDA(cudaMemcpyAsync(h_num_selected_keys_[local_replica_id].get_ptr(),
@@ -271,18 +260,19 @@ class All2AllInputDispatcher : public Dispatcher {
     }  // for dev_id in global_gpu_count
 
     // step 5: exchange selected keys among all GPUs
-    //* Replace NCCL with P2P
-    //! assume global_gpu_od == local_gpu_id
-    // for (size_t dev_id = 0; dev_id < global_gpu_count; dev_id++) {
-    //   CK_CUDA(cudaMemcpyAsync(exchanged_keys_buf_[dev_id].get_ptr() + 
-    //                             h_recv_chunk_offsets_[dev_id].get_ptr()[local_replica_id],
-    //                           selected_keys_buf_[local_replica_id].get_ptr() + dev_id * num_keys_per_rank_,
-    //                           h_num_selected_keys_[local_replica_id].get_ptr()[dev_id] * sizeof(KeyType),
-    //                           cudaMemcpyDefault,
-    //                           local_gpu->get_stream()));
-    // }
-    // CK_CUDA(cudaStreamSynchronize(local_gpu->get_stream()));
-    // resource_mgr_->sync_cpu_threads();
+    CK_NCCL(ncclGroupStart());
+    for (size_t dev_id = 0; dev_id < global_gpu_count; dev_id++) {
+      CK_NCCL(ncclSend(selected_keys_buf_[local_replica_id].get_ptr() + dev_id * num_keys_per_rank_,
+                       h_num_selected_keys_[local_replica_id].get_ptr()[dev_id],
+                       GetNCCLType<KeyType>(),
+                       /*peer=*/dev_id, local_gpu->get_nccl(), local_gpu->get_stream()));
+      CK_NCCL(ncclRecv(exchanged_keys_buf_[local_replica_id].get_ptr() +
+                           h_recv_chunk_offsets_[local_replica_id].get_ptr()[dev_id],
+                       h_num_exchanged_keys_[local_replica_id].get_ptr()[dev_id],
+                       GetNCCLType<KeyType>(),
+                       /*peer=*/dev_id, local_gpu->get_nccl(), local_gpu->get_stream()));
+    }  // for dev_id in global_gpu_count
+    CK_NCCL(ncclGroupEnd());
 
     // set output of this dispatcher
     replica_context->set_output("replica_exchanged_keys", exchanged_keys_buf_[local_replica_id]);

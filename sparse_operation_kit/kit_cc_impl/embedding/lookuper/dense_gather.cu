@@ -14,50 +14,25 @@
  * limitations under the License.
  */
 
-#include <cstddef>
-#include <cstdint>
-#include <iostream>
 #include "common.cuh"
-#include "common.h"
 #include "common/include/dumping_functions.h"
 #include "common/include/forward_functions.h"
 #include "hashtable/simple_hashtable.h"
 #include "operation/operation_interface.h"
-#include "tensor_buffer/tensor_interface.h"
 
 namespace SparseOperationKit {
 
-template <typename KeyType, typename Hasher, typename EmbeddingType>
-__global__ static void gatherKernel(const size_t EmbeddingDimension, float **__restrict__ emb_tbl_ptr,
-                                    KeyType const *keys, size_t *mapped_indices, const size_t num_keys, 
-                                    EmbeddingType *outputs, const size_t chunks) {
-  for (size_t id = blockIdx.x * blockDim.x + threadIdx.x; id < num_keys * EmbeddingDimension;
+template <typename EmbeddingType>
+__global__ static void gatherKernel(const size_t EmbeddingDimension, float *__restrict__ inputs,
+                                    size_t *indices, size_t num_indices, EmbeddingType *outputs) {
+  for (size_t id = blockIdx.x * blockDim.x + threadIdx.x; id < num_indices * EmbeddingDimension;
        id += blockDim.x * gridDim.x) {
     size_t item_id = id / EmbeddingDimension;
     size_t embedding_id = id - item_id * EmbeddingDimension;
-    size_t chunk_id = Hasher::compute(keys[item_id]) % chunks;
 
-    size_t index = static_cast<size_t>(mapped_indices[item_id]);
+    size_t index = static_cast<size_t>(indices[item_id]);
     outputs[id] = HugeCTR::TypeConvertFunc<EmbeddingType, float>::convert(
-        emb_tbl_ptr[chunk_id][index * EmbeddingDimension + embedding_id]);
-  }
-}
-
-template <typename KeyType>
-__global__ static void scatterIdxKernel(KeyType const *chunk_keys, uint32_t const *chunk_indices,
-                                  size_t const *chunk_mapped_offset, size_t **replica_mapped_offset,
-                                  size_t chunks, size_t max_chunk_size, 
-                                  uint32_t const *replica_select_size, uint32_t const *replica_recv_offset) {
-  uint32_t gpu_idx = blockIdx.y;
-  uint32_t curr_chunk_size = replica_select_size[gpu_idx];
-  uint32_t const *curr_input_idx = chunk_indices + gpu_idx * max_chunk_size;
-  size_t *curr_output = replica_mapped_offset[gpu_idx] + replica_recv_offset[gpu_idx];
-
-  for (size_t id = blockIdx.x * blockDim.x + threadIdx.x; id < curr_chunk_size;
-       id += blockDim.x * gridDim.x) {
-
-    size_t index = curr_input_idx[id];
-    curr_output[id] = chunk_mapped_offset[index];
+        inputs[index * EmbeddingDimension + embedding_id]);
   }
 }
 
@@ -71,9 +46,7 @@ class DenseGather : public EmbeddingLookuper {
                            base_context()->get_slot_num() * base_context()->get_nnz_per_slot()) {
     const size_t local_gpu_count = resource_mgr_->get_local_gpu_count();
     mapped_indices_buf_.reserve(local_gpu_count);
-    h_emb_tbl_ptr_.reserve(local_gpu_count);
-    h_mapped_indices_ptr_.reserve(local_gpu_count);
-    h_replica_recv_chunk_offset_.reserve(local_gpu_count);
+    gathered_embeddings_buf_.reserve(local_gpu_count);
 
     if (sizeof(size_t) != sizeof(int64_t))
       throw std::runtime_error(
@@ -84,7 +57,6 @@ class DenseGather : public EmbeddingLookuper {
     if (param->get_hashtable(0)->identical_mapping()) {
       // identical_mapping waste memory spaces, so that lookuper
       // will set its wanted hashtable for param
-      MESSAGE("[INFO]: use Simple HashTable");
       const size_t global_gpu_count = resource_mgr_->get_global_gpu_count();
       auto stream = resource_mgr_->get_local_gpu(0)->get_stream();
       const size_t capacity = param->get_hashtable(0)->get_capacity(stream);
@@ -109,31 +81,13 @@ class DenseGather : public EmbeddingLookuper {
         mapped_indices_buf_.push_back(tensor);
       }
       {
-        Tensor2<float*> tensor;
-        host_buffer->reserve({global_gpu_count}, &tensor);
-        h_emb_tbl_ptr_.push_back(tensor);
+        Tensor2<ValueType> tensor;
+        buffer->reserve({global_gpu_count, embedding_vec_size * num_keys_per_rank_}, &tensor);
+        gathered_embeddings_buf_.push_back(tensor);
       }
     }  // for dev_id in local_gpu_count
   }
-
-  void allocate_backward_spaces() override {
-    const size_t local_gpu_count = resource_mgr_->get_local_gpu_count();
-    const size_t global_gpu_count = resource_mgr_->get_global_gpu_count();
-    for (size_t dev_id = 0; dev_id < local_gpu_count; dev_id++) {
-      auto &host_buffer = base_context()->get_host_buffer(dev_id);
-      {
-        Tensor2<size_t*> tensor;
-        host_buffer->reserve({global_gpu_count}, &tensor);
-        h_mapped_indices_ptr_.push_back(tensor);
-      }
-      {
-        Tensor2<uint32_t> tensor;
-        host_buffer->reserve({global_gpu_count}, &tensor);
-        h_replica_recv_chunk_offset_.push_back(tensor);
-      }
-    }  // for dev_id in local_gpu_count
-  }
-
+  void allocate_backward_spaces() override {}
   void forward(const Context_t &replica_context, const bool training) override {
     const size_t global_gpu_count = resource_mgr_->get_global_gpu_count();
     const size_t global_replica_id = replica_context->get_global_replica_id();
@@ -142,44 +96,35 @@ class DenseGather : public EmbeddingLookuper {
 
     auto &hashtable = param_->get_hashtable(local_replica_id);
 
-    const auto &input_keys = replica_context->input("replica_values");
+    const auto &replica_exchanged_keys = replica_context->input("replica_exchanged_keys");
     const auto &replica_h_recv_chunk_offsets =
         replica_context->input("replica_h_recv_chunk_offsets");
     const uint32_t h_local_nnz =
         replica_h_recv_chunk_offsets->GetPtrWithType<uint32_t>()[global_gpu_count];
-    auto &replica_output = replica_context->output("replica_output");
-
     // step 1: get index using keys
     if (training) {
-      hashtable->get_insert(input_keys->GetPtrWithType<KeyType>(),
+      hashtable->get_insert(replica_exchanged_keys->GetPtrWithType<KeyType>(),
                             mapped_indices_buf_[local_replica_id].get_ptr(),
-                            /*nnz=*/input_keys->get_num_elements(), local_gpu->get_stream());
+                            /*nnz=*/h_local_nnz, local_gpu->get_stream());
     } else {
-      hashtable->get(input_keys->GetPtrWithType<KeyType>(),
+      hashtable->get(replica_exchanged_keys->GetPtrWithType<KeyType>(),
                      mapped_indices_buf_[local_replica_id].get_ptr(),
-                     /*nnz=*/input_keys->get_num_elements(), local_gpu->get_stream());
+                     /*nnz=*/h_local_nnz, local_gpu->get_stream());
     }
 
     // step 2: gather embedding vectors from embedding table
-    //! assume local_gpu_count == global_gpu_count
-    for (size_t dev_id = 0; dev_id < global_gpu_count; ++dev_id) {
-      const auto &embedding_table = param_->get_embedding_table_tensor(dev_id);
-      h_emb_tbl_ptr_[local_replica_id].get_ptr()[dev_id] = embedding_table->GetPtrWithType<float>();
-    }
-
-    //* READ style synchronize
-    //  once Embedding table is set, no need for CPU barrier
-    gatherKernel<KeyType, IdenticalHash, ValueType><<<local_gpu->get_sm_count() * 2, 1024ul, 0, local_gpu->get_stream()>>>(
-        param_->get_embedding_vec_size(),
-        h_emb_tbl_ptr_[local_replica_id].get_ptr(),
-        input_keys->GetPtrWithType<KeyType>(),
-        mapped_indices_buf_[local_replica_id].get_ptr(),
-        input_keys->get_num_elements(),
-        replica_output->GetPtrWithType<ValueType>(),
-        global_gpu_count
-    );
+    const auto &embedding_table = param_->get_embedding_table_tensor(local_replica_id);
+    gatherKernel<ValueType><<<local_gpu->get_sm_count() * 2, 1024ul, 0, local_gpu->get_stream()>>>(
+        /*EmbeddingDimension=*/param_->get_embedding_vec_size(),
+        /*inputs=*/embedding_table->GetPtrWithType<float>(),
+        /*indices=*/mapped_indices_buf_[local_replica_id].get_ptr(),
+        /*num_indices=*/h_local_nnz,
+        /*outputs=*/gathered_embeddings_buf_[local_replica_id].get_ptr());
     CK_CUDA(cudaGetLastError());
 
+    // step 3: set the output of embedding lookuper
+    replica_context->set_output("replica_gathered_embeddings",
+                                gathered_embeddings_buf_[local_replica_id]);
     // write host_nnz in current iteration
     auto &host_nnz = replica_context->output("replica_host_nnz");
     host_nnz->GetPtrWithType<size_t>()[0] = static_cast<size_t>(h_local_nnz);
@@ -191,55 +136,17 @@ class DenseGather : public EmbeddingLookuper {
     const size_t local_replica_id = resource_mgr_->cal_local_id_from_global_id(global_replica_id);
     const auto &local_gpu = resource_mgr_->get_local_gpu(local_replica_id);
 
-    const auto &replica_exchanged_key = replica_context->input("replica_exchanged_keys");
-    const auto &replica_selected_indices = replica_context->input("replica_selected_indices_buf");
-    const auto &replica_num_selected_keys = replica_context->input("replica_num_selected_keys");
     const auto &replica_h_recv_chunk_offsets =
         replica_context->input("replica_h_recv_chunk_offsets");
     const uint32_t h_local_nnz =
         replica_h_recv_chunk_offsets->GetPtrWithType<uint32_t>()[global_gpu_count];
     auto &replica_value_index_tensor = replica_context->output("value_index_tensor");
 
-    //* Key Exchanged
-    // {
-    //   auto &hashtable = param_->get_hashtable(local_replica_id);
-    //   hashtable->get_insert(replica_exchanged_key->GetPtrWithType<KeyType>(), 
-    //                         replica_value_index_tensor->GetPtrWithType<size_t>(), 
-    //                         h_local_nnz, local_gpu->get_stream());
-    //   CK_CUDA(cudaMemcpyAsync(replica_value_index_tensor->GetPtrWithType<int64_t>(),
-    //                           mapped_indices_buf_[local_replica_id].get_ptr(),
-    //                           sizeof(size_t) * h_local_nnz, cudaMemcpyDeviceToDevice,
-    //                           local_gpu->get_stream()));
-    // }
-    
-    // //* P2P direct write 
-    {
-      //! assume local_gpu_cnt == global_gpu_cnt
-      for (size_t dev_id = 0; dev_id < global_gpu_count; dev_id++) {
-        h_mapped_indices_ptr_[dev_id].get_ptr()[local_replica_id] = 
-          replica_value_index_tensor->GetPtrWithType<size_t>();
-        h_replica_recv_chunk_offset_[dev_id].get_ptr()[local_replica_id] =
-          replica_h_recv_chunk_offsets->GetPtrWithType<uint32_t>()[dev_id];
-      }
-      resource_mgr_->sync_cpu_threads();
-      //! assume sizeof(size_t) == sizeof(int64_t)
-      //* WRITE style synchronize
-      {
-        dim3 const grid_dim(2 * local_gpu->get_sm_count() / global_gpu_count, global_gpu_count);
-        scatterIdxKernel<KeyType><<<grid_dim, 1024ul, 0, local_gpu->get_stream()>>>(
-          replica_exchanged_key->GetPtrWithType<KeyType>(), 
-          replica_selected_indices->GetPtrWithType<uint32_t>(),
-          mapped_indices_buf_[local_replica_id].get_ptr(),
-          h_mapped_indices_ptr_[local_replica_id].get_ptr(),
-          global_gpu_count,
-          num_keys_per_rank_,
-          replica_num_selected_keys->GetPtrWithType<uint32_t>(),
-          h_replica_recv_chunk_offset_[local_replica_id].get_ptr());
-        CK_CUDA(cudaGetLastError());
-      }
-      CK_CUDA(cudaStreamSynchronize(local_gpu->get_stream()));
-      resource_mgr_->sync_cpu_threads();
-    }
+    // FIXME: what if sizeof(size_t) != sizeof(int64_t)
+    CK_CUDA(cudaMemcpyAsync(replica_value_index_tensor->GetPtrWithType<int64_t>(),
+                            mapped_indices_buf_[local_replica_id].get_ptr(),
+                            sizeof(size_t) * h_local_nnz, cudaMemcpyDeviceToDevice,
+                            local_gpu->get_stream()));
   }
 
   void save_params(std::shared_ptr<Tensor> &keys, std::shared_ptr<Tensor> &embedding_values,
@@ -261,11 +168,7 @@ class DenseGather : public EmbeddingLookuper {
 
   // forward spaces
   Tensors2<size_t> mapped_indices_buf_;
-  Tensors2<float*> h_emb_tbl_ptr_;
-
-  // backward spaces
-  Tensors2<size_t*> h_mapped_indices_ptr_;
-  Tensors2<uint32_t> h_replica_recv_chunk_offset_;
+  Tensors2<ValueType> gathered_embeddings_buf_;
 };
 
 REGISTER_EMB_LOOKUPER_BUILDER("dense_gather", DataType::Int64, DataType::Float32,
