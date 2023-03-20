@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include "common.h"
 #include "common/include/forward_functions.h"
 #include "operation/operation_interface.h"
 
@@ -100,6 +105,15 @@ __global__ void gatherExKernel(const size_t EmbeddingDimension, EmbeddingType co
   }
 }
 
+template <typename EmbeddingType>
+__host__ int embGatherCmp(const EmbeddingType *p2p, const EmbeddingType *nccl, size_t nElem) {
+  int res = 0;
+  for (size_t i = 0; i < nElem; ++i) {
+    if (p2p[i] != nccl[i]) res++;
+  }
+  return res;
+}
+
 template <typename ValueType>
 class All2AllOutputDispatcher : public Dispatcher {
  public:
@@ -111,6 +125,8 @@ class All2AllOutputDispatcher : public Dispatcher {
     const size_t local_gpu_count = resource_mgr_->get_local_gpu_count();
     exchanged_embeddings_buf_.reserve(local_gpu_count);
     gathered_gradients_buf_.reserve(local_gpu_count);
+    h_output_nccl_.reserve(local_gpu_count);
+    h_output_p2p_.reserve(local_gpu_count);
   }
 
   void allocate_forward_spaces() override {
@@ -119,10 +135,21 @@ class All2AllOutputDispatcher : public Dispatcher {
     const size_t embedding_vec_size = base_context()->get_param()->get_embedding_vec_size();
     for (size_t dev_id = 0; dev_id < local_gpu_count; dev_id++) {
       auto &buffer = base_context()->get_buffer(dev_id);
+      auto &host_buffer = base_context()->get_host_buffer(dev_id);
       {
         Tensor2<ValueType> tensor;
         buffer->reserve({global_gpu_count, embedding_vec_size * num_keys_per_rank_}, &tensor);
         exchanged_embeddings_buf_.push_back(tensor);
+      }
+      {
+        Tensor2<ValueType> tensor;
+        host_buffer->reserve({global_gpu_count, embedding_vec_size * num_keys_per_rank_}, &tensor);
+        h_output_nccl_.push_back(tensor);
+      }
+      {
+        Tensor2<ValueType> tensor;
+        host_buffer->reserve({global_gpu_count, embedding_vec_size * num_keys_per_rank_}, &tensor);
+        h_output_p2p_.push_back(tensor);
       }
     }  // for dev_id in local_gpu_count
   }
@@ -156,9 +183,24 @@ class All2AllOutputDispatcher : public Dispatcher {
     const auto &replica_selected_indices_buf =
         replica_context->input("replica_selected_indices_buf");
 
+    const auto &input_keys = replica_context->input("replica_values");
     auto &replica_output = replica_context->output("replica_output");
-    // step 1: exchange embedding values among all GPUs.
     const size_t embedding_vec_size = base_context()->get_param()->get_embedding_vec_size();
+    //* P2P Impl
+    {
+      // P2P has already GATHERed embedding vector
+      cudaMemcpyAsync(h_output_p2p_[local_replica_id].get_ptr(), 
+                      replica_output->GetPtrWithType<ValueType>(),
+                      input_keys->get_num_elements() * embedding_vec_size * sizeof(ValueType), 
+                      cudaMemcpyDeviceToHost,
+                      local_gpu->get_stream());
+      cudaStreamSynchronize(local_gpu->get_stream());
+      // MESSAGE("[INFO]: gpu" + std::to_string(local_replica_id) + " finishes P2P Impl.");
+      CK_CUDA(cudaGetLastError());
+    }
+
+    //* NCCL Impl
+    // step 1: exchange embedding values among all GPUs.
     CK_NCCL(ncclGroupStart());
     for (size_t dev_id = 0; dev_id < global_gpu_count; dev_id++) {
       CK_NCCL(ncclSend(
@@ -194,6 +236,29 @@ class All2AllOutputDispatcher : public Dispatcher {
           /*max_chunk_size=*/num_keys_per_rank_,
           /*chunk_sizes=*/replica_num_selected_keys->GetPtrWithType<uint32_t>());
       CK_CUDA(cudaGetLastError());
+    }
+
+    //* TEST
+    {
+      cudaMemcpyAsync(h_output_nccl_[local_replica_id].get_ptr(), 
+                      replica_output->GetPtrWithType<ValueType>(),
+                      input_keys->get_num_elements() * embedding_vec_size * sizeof(ValueType), 
+                      cudaMemcpyDeviceToHost,
+                      local_gpu->get_stream());
+      cudaStreamSynchronize(local_gpu->get_stream());
+      CK_CUDA(cudaGetLastError());
+      // MESSAGE("[INFO]: gpu" + std::to_string(local_replica_id) + " ready.");
+      // std::cout << (float)h_output_nccl_[local_replica_id].get_ptr()[0] << (float)h_output_p2p_[local_replica_id].get_ptr()[0] << std::endl;
+      resource_mgr_->sync_cpu_threads();
+      int res = embGatherCmp(h_output_p2p_[local_replica_id].get_ptr(), 
+                            h_output_nccl_[local_replica_id].get_ptr(),
+                           input_keys->get_num_elements() * embedding_vec_size);
+      resource_mgr_->sync_cpu_threads();
+      if (res != 0) {
+        MESSAGE("[ERROR]: embedding vector in gpu" + std::to_string(local_replica_id) + " is inconsistency");
+      } else {
+        MESSAGE("[INFO]: embedding vector in gpu" + std::to_string(local_replica_id) + " pass.");
+      }
     }
   }
 
@@ -260,6 +325,10 @@ class All2AllOutputDispatcher : public Dispatcher {
 
   // backward spaces
   Tensors2<ValueType> gathered_gradients_buf_;
+
+  // test spaces
+  Tensors2<ValueType> h_output_nccl_;
+  Tensors2<ValueType> h_output_p2p_;
 };
 
 REGISTER_OUTPUT_DISPATHER_BUILDER("All2AllOutput", DataType::Int64, DataType::Float32,

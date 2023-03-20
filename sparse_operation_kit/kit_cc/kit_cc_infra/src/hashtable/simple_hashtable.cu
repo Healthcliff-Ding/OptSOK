@@ -15,6 +15,7 @@
  */
 
 #include "hashtable/simple_hashtable.h"
+#include <cassert>
 
 namespace SparseOperationKit {
 
