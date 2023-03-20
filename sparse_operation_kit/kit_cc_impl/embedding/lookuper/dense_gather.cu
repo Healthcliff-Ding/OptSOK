@@ -15,6 +15,7 @@
  */
 
 #include <cstddef>
+#include <cstdint>
 #include "common.cuh"
 #include "common.h"
 #include "common/include/dumping_functions.h"
@@ -54,6 +55,33 @@ __global__ static void p2pGatherKernel(const size_t EmbeddingDimension, float **
   }
 }
 
+template <typename KeyType>
+__global__ static void scatterIdxKernel(KeyType const *chunk_keys, uint32_t const *chunk_indices,
+                                  size_t const *chunk_mapped_offset, size_t **replica_mapped_offset,
+                                  size_t chunks, size_t max_chunk_size, 
+                                  uint32_t const *replica_select_size, uint32_t const *replica_recv_offset) {
+  uint32_t gpu_idx = blockIdx.y;
+  uint32_t curr_chunk_size = replica_select_size[gpu_idx];
+  uint32_t const *curr_input_idx = chunk_indices + gpu_idx * max_chunk_size;
+  size_t *curr_output = replica_mapped_offset[gpu_idx] + replica_recv_offset[gpu_idx];
+
+  for (size_t id = blockIdx.x * blockDim.x + threadIdx.x; id < curr_chunk_size;
+       id += blockDim.x * gridDim.x) {
+
+    size_t index = curr_input_idx[id];
+    curr_output[id] = chunk_mapped_offset[index];
+  }
+}
+
+template <typename IndexType>
+__host__ int gradIdxCmp(const IndexType *p2p, const IndexType *nccl, size_t nElem) {
+  int res = 0;
+  for (size_t i = 0; i < nElem; ++i) {
+    if (p2p[i] != nccl[i]) res++;
+  }
+  return res;
+}
+
 template <typename KeyType, typename ValueType>
 class DenseGather : public EmbeddingLookuper {
  public:
@@ -67,6 +95,10 @@ class DenseGather : public EmbeddingLookuper {
     gathered_embeddings_buf_.reserve(local_gpu_count);
     p2p_mapped_indices_buf_.reserve(local_gpu_count);
     h_emb_tbl_ptr_.reserve(local_gpu_count);
+    h_mapped_indices_ptr_.reserve(local_gpu_count);
+    h_replica_recv_chunk_offset_.reserve(local_gpu_count);
+    h_output_nccl_.reserve(local_gpu_count);
+    h_output_p2p_.reserve(local_gpu_count);
 
     if (sizeof(size_t) != sizeof(int64_t))
       throw std::runtime_error(
@@ -118,7 +150,35 @@ class DenseGather : public EmbeddingLookuper {
       }
     }  // for dev_id in local_gpu_count
   }
-  void allocate_backward_spaces() override {}
+
+  void allocate_backward_spaces() override {
+    const size_t local_gpu_count = resource_mgr_->get_local_gpu_count();
+    const size_t global_gpu_count = resource_mgr_->get_global_gpu_count();
+    for (size_t dev_id = 0; dev_id < local_gpu_count; dev_id++) {
+      auto &host_buffer = base_context()->get_host_buffer(dev_id);
+      {
+        Tensor2<size_t*> tensor;
+        host_buffer->reserve({global_gpu_count}, &tensor);
+        h_mapped_indices_ptr_.push_back(tensor);
+      }
+      {
+        Tensor2<uint32_t> tensor;
+        host_buffer->reserve({global_gpu_count}, &tensor);
+        h_replica_recv_chunk_offset_.push_back(tensor);
+      }
+      {
+        Tensor2<int64_t> tensor;
+        host_buffer->reserve({global_gpu_count * num_keys_per_rank_}, &tensor);
+        h_output_nccl_.push_back(tensor);
+      }
+      {
+        Tensor2<int64_t> tensor;
+        host_buffer->reserve({global_gpu_count * num_keys_per_rank_}, &tensor);
+        h_output_p2p_.push_back(tensor);
+      }
+    }  // for dev_id in local_gpu_count
+  }
+
   void forward(const Context_t &replica_context, const bool training) override {
     const size_t global_gpu_count = resource_mgr_->get_global_gpu_count();
     const size_t global_replica_id = replica_context->get_global_replica_id();
@@ -211,13 +271,60 @@ class DenseGather : public EmbeddingLookuper {
 
     //* NCCL Impl
     // FIXME: what if sizeof(size_t) != sizeof(int64_t)
-    CK_CUDA(cudaMemcpyAsync(replica_value_index_tensor->GetPtrWithType<int64_t>(),
-                            mapped_indices_buf_[local_replica_id].get_ptr(),
-                            sizeof(size_t) * h_local_nnz, cudaMemcpyDeviceToDevice,
-                            local_gpu->get_stream()));
+    {
+      CK_CUDA(cudaMemcpyAsync(replica_value_index_tensor->GetPtrWithType<int64_t>(),
+                              mapped_indices_buf_[local_replica_id].get_ptr(),
+                              sizeof(size_t) * h_local_nnz, cudaMemcpyDeviceToDevice,
+                              local_gpu->get_stream()));
+      CK_CUDA(cudaMemcpyAsync(h_output_nccl_[local_replica_id].get_ptr(),
+                              replica_value_index_tensor->GetPtrWithType<int64_t>(),
+                              sizeof(size_t) * h_local_nnz, cudaMemcpyDeviceToHost,
+                              local_gpu->get_stream()));
+      CK_CUDA(cudaStreamSynchronize(local_gpu->get_stream()));
+    }
     //* P2P Impl
     {
-      
+      const auto &replica_exchanged_key = replica_context->input("replica_exchanged_keys");
+      const auto &replica_selected_indices = replica_context->input("replica_selected_indices_buf");
+      const auto &replica_num_selected_keys = replica_context->input("replica_num_selected_keys");
+      //! assume local_gpu_cnt == global_gpu_cnt
+      for (size_t dev_id = 0; dev_id < global_gpu_count; dev_id++) {
+        h_mapped_indices_ptr_[dev_id].get_ptr()[local_replica_id] = 
+          replica_value_index_tensor->GetPtrWithType<size_t>();
+        h_replica_recv_chunk_offset_[dev_id].get_ptr()[local_replica_id] =
+          replica_h_recv_chunk_offsets->GetPtrWithType<uint32_t>()[dev_id];
+      }
+      resource_mgr_->sync_cpu_threads();
+      //! assume sizeof(size_t) == sizeof(int64_t)
+      //* WRITE style synchronize
+      {
+        dim3 const grid_dim(2 * local_gpu->get_sm_count() / global_gpu_count, global_gpu_count);
+        scatterIdxKernel<KeyType><<<grid_dim, 1024ul, 0, local_gpu->get_stream()>>>(
+          replica_exchanged_key->GetPtrWithType<KeyType>(), 
+          replica_selected_indices->GetPtrWithType<uint32_t>(),
+          p2p_mapped_indices_buf_[local_replica_id].get_ptr(),
+          h_mapped_indices_ptr_[local_replica_id].get_ptr(),
+          global_gpu_count,
+          num_keys_per_rank_,
+          replica_num_selected_keys->GetPtrWithType<uint32_t>(),
+          h_replica_recv_chunk_offset_[local_replica_id].get_ptr());
+        CK_CUDA(cudaGetLastError());
+      }
+      CK_CUDA(cudaStreamSynchronize(local_gpu->get_stream()));
+      resource_mgr_->sync_cpu_threads();
+    }
+    {
+      CK_CUDA(cudaMemcpyAsync(h_output_p2p_[local_replica_id].get_ptr(),
+                              replica_value_index_tensor->GetPtrWithType<int64_t>(),
+                              sizeof(size_t) * h_local_nnz, cudaMemcpyDeviceToHost,
+                              local_gpu->get_stream()));
+      CK_CUDA(cudaStreamSynchronize(local_gpu->get_stream()));
+      int res = gradIdxCmp(h_output_p2p_[local_replica_id].get_ptr(), 
+                           h_output_nccl_[local_replica_id].get_ptr(),
+                           h_local_nnz);
+      if (res != 0) {
+        MESSAGE("[ERROR]: gradient indices in gpu" + std::to_string(local_replica_id) + " is inconsistency");
+      }
     }
   }
 
@@ -244,6 +351,14 @@ class DenseGather : public EmbeddingLookuper {
   // p2p forward space
   Tensors2<size_t> p2p_mapped_indices_buf_;
   Tensors2<float*> h_emb_tbl_ptr_;
+
+  // p2p backward spaces
+  Tensors2<size_t*> h_mapped_indices_ptr_;
+  Tensors2<uint32_t> h_replica_recv_chunk_offset_;
+  
+  // test space
+  Tensors2<int64_t> h_output_nccl_;
+  Tensors2<int64_t> h_output_p2p_;
 };
 
 REGISTER_EMB_LOOKUPER_BUILDER("dense_gather", DataType::Int64, DataType::Float32,

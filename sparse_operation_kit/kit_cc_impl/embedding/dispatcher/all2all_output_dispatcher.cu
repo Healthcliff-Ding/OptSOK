@@ -256,8 +256,6 @@ class All2AllOutputDispatcher : public Dispatcher {
       resource_mgr_->sync_cpu_threads();
       if (res != 0) {
         MESSAGE("[ERROR]: embedding vector in gpu" + std::to_string(local_replica_id) + " is inconsistency");
-      } else {
-        MESSAGE("[INFO]: embedding vector in gpu" + std::to_string(local_replica_id) + " pass.");
       }
     }
   }
