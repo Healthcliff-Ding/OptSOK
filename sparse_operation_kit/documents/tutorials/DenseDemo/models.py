@@ -171,7 +171,7 @@ class SOKDenseDemo(tf.keras.models.Model):
 
         self.dense_layers = []
         for _ in range(self.num_dense_layers):
-            self.layer = tf.keras.layers.Dense(units=1024, activation="relu")
+            self.layer = tf.keras.layers.Dense(units=256, activation="relu")
             self.dense_layers.append(self.layer)
 
         self.out_layer = tf.keras.layers.Dense(

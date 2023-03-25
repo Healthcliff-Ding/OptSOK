@@ -268,15 +268,27 @@ def tf_dataset(keys, labels, batchsize, to_sparse_tensor=False, repeat=None, arg
                 raise ValueError("Not supported key_dtype.")
         return keys, labels
 
-    dataset = tf.data.Dataset.from_tensor_slices((keys, labels))
+    def _sequentual_batch_gen():
+        for i in range(0, num_of_samples, batchsize):
+            keys, labels
+            yield keys[i:i+batchsize], labels[i:i+batchsize]
+
+    dataset = tf.data.Dataset.from_generator(
+        _sequentual_batch_gen,
+        output_signature=(
+            tf.TensorSpec(shape=(batchsize, slot_num, max_nnz), dtype=tf.int64),
+            tf.TensorSpec(shape=(batchsize, max_nnz), dtype=tf.int64)
+        ))
+    # dataset = tf.data.Dataset.from_tensor_slices((keys, labels))
     dataset = dataset.repeat(repeat)
-    dataset = dataset.batch(batchsize, drop_remainder=True)
-    if to_sparse_tensor:
-        dataset = dataset.map(
-            lambda keys, labels: _convert_to_sparse(keys, labels), num_parallel_calls=1
-        )
-    else:
-        dataset = dataset.map(lambda keys, labels: _cast_values(keys, labels), num_parallel_calls=1)
+    #! API 狗都不调
+    # dataset = dataset.batch(batchsize, drop_remainder=True)
+    # if to_sparse_tensor:
+    #     dataset = dataset.map(
+    #         lambda keys, labels: _convert_to_sparse(keys, labels), num_parallel_calls=1
+    #     )
+    # else:
+    #     dataset = dataset.map(lambda keys, labels: _cast_values(keys, labels), num_parallel_calls=1)
     return dataset
 
 
