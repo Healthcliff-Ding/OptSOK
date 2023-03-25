@@ -23,13 +23,13 @@ import numpy as np
 
 
 def generate_datas(args):
-    counts = args.iter_num // 10
+    counts = args.iter_num
 
     total_samples, total_labels = None, None
 
     for _ in range(counts):
         random_samples, random_labels = utility.generate_random_samples(
-            num_of_samples=args.global_batch_size * 10,
+            num_of_samples=args.global_batch_size,
             vocabulary_size=args.vocabulary_size,
             slot_num=args.slot_num,
             max_nnz=args.nnz_per_slot,
