@@ -87,8 +87,8 @@ def main(args):
                 zip(emb_grads, emb_variable), experimental_aggregate_gradients=False
             )
         dense_optimizer.apply_gradients(zip(grads, other_variable))
-        # return loss
-        return loss, emb_grads[0].values[0][0], grads[-1]
+        return loss
+        # return loss, emb_grads[0].values[0][0], grads[-1]
 
     @tf.function
     def _warmup_step(inputs, labels):
@@ -117,8 +117,9 @@ def main(args):
             rng = nvtx.start_range(message="Iteration_" + str(i), color="blue")
             
             start = time.clock_gettime(time.CLOCK_MONOTONIC)
-            # replica_loss = strategy.run(_train_step, args=(inputs, labels))
-            replica_loss, _, _ = strategy.run(_train_step, args=(inputs, labels))
+            replica_loss = strategy.run(_train_step, args=(inputs, labels))
+            sok.kit_lib.sync_replica()
+            # replica_loss, _, _ = strategy.run(_train_step, args=(inputs, labels))
             # NOTE: make async execution end
             # NOTE: result of `local_result` is still PerReplica
             # grads_list = strategy.experimental_local_results(replica_grad)
