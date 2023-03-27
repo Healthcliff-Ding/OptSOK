@@ -126,6 +126,7 @@ class Facade final {
                        const tensorflow::Tensor* local_indices_tensor,
                        const size_t local_replica_id, const float learning_rate,
                        const size_t current_step);
+  void sync_replica();
 
   void dump_to_file(
       const tensorflow::core::RefCountPtr<tensorflow::EmbeddingVariable>& emb_variable,

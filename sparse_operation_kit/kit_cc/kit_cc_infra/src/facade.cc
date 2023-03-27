@@ -482,6 +482,11 @@ void Facade::apply_gradients(
 #endif
 }
 
+void Facade::sync_replica() {
+  resources_mgr_->sync_local_gpus();
+  resources_mgr_->sync_cpu_threads();
+}
+
 void Facade::dump_to_file(
     const tensorflow::core::RefCountPtr<tensorflow::EmbeddingVariable>& emb_variable,
     const std::string filepath) {
