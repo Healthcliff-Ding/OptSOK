@@ -74,6 +74,7 @@ create_embedding_dense = kit_ops.create_embedding_dense
 plugin_sparse_fprop = kit_ops.plugin_sparse_fprop
 plugin_dense_fprop = kit_ops.plugin_dense_fprop
 plugin_bprop = kit_ops.plugin_bprop
+sync_replica = kit_ops.sync_replica
 
 dump_to_file = kit_ops.dump_to_file
 restore_from_file = kit_ops.restore_from_file
