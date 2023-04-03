@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <bits/types/struct_timeval.h>
+#include <sys/time.h>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -26,6 +28,12 @@
 #include "tensor_buffer/tensor_interface.h"
 
 namespace SparseOperationKit {
+
+static void profile_time(size_t id, int step, float cpu_time, float gpu_time) {
+  std::cout << "step " << step << ": CPU " 
+            << std::fixed << cpu_time / 100 << std::setprecision(9)
+            << "ms GPU "  << gpu_time / 100 << "ms" << std::endl; 
+}
 
 template <typename KeyType, typename Hasher, typename EmbeddingType>
 __global__ static void gatherKernel(const size_t EmbeddingDimension, float **__restrict__ emb_tbl_ptr,
@@ -74,6 +82,15 @@ class DenseGather : public EmbeddingLookuper {
     h_emb_tbl_ptr_.reserve(local_gpu_count);
     h_mapped_indices_ptr_.reserve(local_gpu_count);
     h_replica_recv_chunk_offset_.reserve(local_gpu_count);
+
+    // Profile Initialize
+    for (size_t i = 0; i < 4; ++i) {
+      cnt[i][0] = 0; cnt[i][1] = 0;
+      for (size_t j = 0; j < 3; ++j) {
+        cpu_time_acc[i][j] = 0.;
+        gpu_time_acc[i][j] = 0.;          
+      }
+    }
 
     if (sizeof(size_t) != sizeof(int64_t))
       throw std::runtime_error(
@@ -149,7 +166,19 @@ class DenseGather : public EmbeddingLookuper {
         replica_h_recv_chunk_offsets->GetPtrWithType<uint32_t>()[global_gpu_count];
     auto &replica_output = replica_context->output("replica_output");
 
+    // Profile Session
+    // each thread calls once
+    timeval begin, end;
+    cudaEventCreate(&start[local_replica_id]);
+    cudaEventCreate(&stop[local_replica_id]);
+    float cpu_time, gpu_time;
+    cnt[local_replica_id][0]++;
+
     // step 1: get index using keys
+    // start profile
+    gettimeofday(&begin, 0);
+    cudaEventRecord(start[local_replica_id], local_gpu->get_stream());
+
     if (training) {
       hashtable->get_insert(input_keys->GetPtrWithType<KeyType>(),
                             mapped_indices_buf_[local_replica_id].get_ptr(),
@@ -160,8 +189,22 @@ class DenseGather : public EmbeddingLookuper {
                      /*nnz=*/input_keys->get_num_elements(), local_gpu->get_stream());
     }
 
+    cudaEventRecord(stop[local_replica_id], local_gpu->get_stream());
+    cudaEventSynchronize(stop[local_replica_id]);
+    gettimeofday(&end, 0);
+    cpu_time = (1000000.0 * (end.tv_sec - begin.tv_sec) + 
+                end.tv_usec - begin.tv_usec) / 1000.0;
+    cudaEventElapsedTime(&gpu_time, start[local_replica_id], stop[local_replica_id]);
+    cpu_time_acc[local_replica_id][0] += cpu_time;
+    gpu_time_acc[local_replica_id][0] += gpu_time;
+    // end profile
+
     // step 2: gather embedding vectors from embedding table
     //! assume local_gpu_count == global_gpu_count
+    // start profile
+    gettimeofday(&begin, 0);
+    cudaEventRecord(start[local_replica_id], local_gpu->get_stream());
+
     for (size_t dev_id = 0; dev_id < global_gpu_count; ++dev_id) {
       const auto &embedding_table = param_->get_embedding_table_tensor(dev_id);
       h_emb_tbl_ptr_[local_replica_id].get_ptr()[dev_id] = embedding_table->GetPtrWithType<float>();
@@ -178,11 +221,37 @@ class DenseGather : public EmbeddingLookuper {
         replica_output->GetPtrWithType<ValueType>(),
         global_gpu_count
     );
+    cudaEventRecord(stop[local_replica_id], local_gpu->get_stream());
+    cudaEventSynchronize(stop[local_replica_id]);
     CK_CUDA(cudaGetLastError());
 
     // write host_nnz in current iteration
     auto &host_nnz = replica_context->output("replica_host_nnz");
     host_nnz->GetPtrWithType<size_t>()[0] = static_cast<size_t>(h_local_nnz);
+
+    gettimeofday(&end, 0);
+    cpu_time = (1000000.0 * (end.tv_sec - begin.tv_sec) + 
+                end.tv_usec - begin.tv_usec) / 1000.0;
+    cudaEventElapsedTime(&gpu_time, start[local_replica_id], stop[local_replica_id]);
+    cpu_time_acc[local_replica_id][1] += cpu_time;
+    gpu_time_acc[local_replica_id][1] += gpu_time;
+    // end profile
+  
+    // Profile Result
+    if (cnt[local_replica_id][0] == 100) {
+      auto session_name = []() {
+        std::cout << "forward: Dense Gather" << std::endl;
+      };
+      resource_mgr_->blocking_call_once(session_name);
+      for (int i = 0; i < 2; ++i) {
+        resource_mgr_->one_at_a_time(profile_time, local_replica_id, i + 1, 
+                                                          cpu_time_acc[local_replica_id][i], 
+                                                          gpu_time_acc[local_replica_id][i]);
+        cpu_time_acc[local_replica_id][i] = 0.;
+        gpu_time_acc[local_replica_id][i] = 0.;
+      }
+      cnt[local_replica_id][0] = 0;
+    }
   }
 
   void backward(const Context_t &replica_context) override {
@@ -211,7 +280,18 @@ class DenseGather : public EmbeddingLookuper {
     //                           sizeof(size_t) * h_local_nnz, cudaMemcpyDeviceToDevice,
     //                           local_gpu->get_stream()));
     // }
-    
+
+    // Profile Session
+    // each thread calls once
+    timeval begin, end;
+    cudaEventCreate(&start[local_replica_id]);
+    cudaEventCreate(&stop[local_replica_id]);
+    float cpu_time, gpu_time;
+    cnt[local_replica_id][1]++;
+
+    // start profile
+    gettimeofday(&begin, 0);
+
     // //* P2P direct write 
     {
       //! assume local_gpu_cnt == global_gpu_cnt
@@ -226,6 +306,7 @@ class DenseGather : public EmbeddingLookuper {
       //* WRITE style synchronize
       {
         dim3 const grid_dim(2 * local_gpu->get_sm_count() / global_gpu_count, global_gpu_count);
+        cudaEventRecord(start[local_replica_id], local_gpu->get_stream());
         scatterIdxKernel<KeyType><<<grid_dim, 1024ul, 0, local_gpu->get_stream()>>>(
           replica_exchanged_key->GetPtrWithType<KeyType>(), 
           replica_selected_indices->GetPtrWithType<uint32_t>(),
@@ -235,10 +316,35 @@ class DenseGather : public EmbeddingLookuper {
           num_keys_per_rank_,
           replica_num_selected_keys->GetPtrWithType<uint32_t>(),
           h_replica_recv_chunk_offset_[local_replica_id].get_ptr());
+        cudaEventRecord(stop[local_replica_id], local_gpu->get_stream());
+        cudaEventSynchronize(stop[local_replica_id]);
         CK_CUDA(cudaGetLastError());
       }
+
+      gettimeofday(&end, 0);
+      cpu_time = (1000000.0 * (end.tv_sec - begin.tv_sec) + 
+                  end.tv_usec - begin.tv_usec) / 1000.0;
+      cudaEventElapsedTime(&gpu_time, start[local_replica_id], stop[local_replica_id]);
+      cpu_time_acc[local_replica_id][2] += cpu_time;
+      gpu_time_acc[local_replica_id][2] += gpu_time;
+      // end profile
+
       CK_CUDA(cudaStreamSynchronize(local_gpu->get_stream()));
       resource_mgr_->sync_cpu_threads();
+
+      // Profile Result
+      if (cnt[local_replica_id][1] == 100) {
+        auto session_name = []() {
+          std::cout << "backward: Dense Gather" << std::endl;
+        };
+        resource_mgr_->blocking_call_once(session_name);
+        resource_mgr_->one_at_a_time(profile_time, local_replica_id, 1, 
+                                                          cpu_time_acc[local_replica_id][2], 
+                                                          gpu_time_acc[local_replica_id][2]);
+        cpu_time_acc[local_replica_id][2] = 0.;
+        gpu_time_acc[local_replica_id][2] = 0.;
+        cnt[local_replica_id][1] = 0;
+      }
     }
   }
 
@@ -266,6 +372,11 @@ class DenseGather : public EmbeddingLookuper {
   // backward spaces
   Tensors2<size_t*> h_mapped_indices_ptr_;
   Tensors2<uint32_t> h_replica_recv_chunk_offset_;
+
+  // profile spaces
+  cudaEvent_t start[4], stop[4];
+  size_t cnt[4][2];
+  float cpu_time_acc[4][3], gpu_time_acc[4][3];
 };
 
 REGISTER_EMB_LOOKUPER_BUILDER("dense_gather", DataType::Int64, DataType::Float32,
