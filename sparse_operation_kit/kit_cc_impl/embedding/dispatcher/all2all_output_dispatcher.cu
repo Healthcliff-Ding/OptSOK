@@ -14,10 +14,17 @@
  * limitations under the License.
  */
 
+#include <sys/time.h>
 #include "common/include/forward_functions.h"
 #include "operation/operation_interface.h"
 
 namespace SparseOperationKit {
+
+static void profile_time(size_t id, int step, float cpu_time, float gpu_time) {
+  std::cout << "step " << step << ": CPU " 
+            << std::fixed << cpu_time / 100 << std::setprecision(9)
+            << "ms GPU "  << gpu_time / 100 << "ms" << std::endl; 
+}
 
 template <typename EmbeddingType>
 __global__ void reorderKernel(const size_t EmbeddingDimension, EmbeddingType const *inputs,
@@ -111,6 +118,15 @@ class All2AllOutputDispatcher : public Dispatcher {
     const size_t local_gpu_count = resource_mgr_->get_local_gpu_count();
     exchanged_embeddings_buf_.reserve(local_gpu_count);
     gathered_gradients_buf_.reserve(local_gpu_count);
+
+    // Profile Initialize
+    for (int i = 0; i < 4; ++i) {
+      cnt[i][0] = 0; cnt[i][1] = 0;
+      for (int j = 0; j < 4; ++j) {
+        cpu_time_acc[i][j] = 0.;
+        gpu_time_acc[i][j] = 0.;
+      }
+    }
   }
 
   void allocate_forward_spaces() override {
@@ -157,7 +173,17 @@ class All2AllOutputDispatcher : public Dispatcher {
         replica_context->input("replica_selected_indices_buf");
 
     auto &replica_output = replica_context->output("replica_output");
+
+    // Profile Session
+    timeval begin, end;
+    cudaEventCreate(&start[local_replica_id]);
+    cudaEventCreate(&stop[local_replica_id]);
+    float cpu_time, gpu_time;
+    cnt[local_replica_id][0]++;
     // step 1: exchange embedding values among all GPUs.
+    // start profile
+    gettimeofday(&begin, 0);
+    cudaEventRecord(start[local_replica_id], local_gpu->get_stream());
     const size_t embedding_vec_size = base_context()->get_param()->get_embedding_vec_size();
     CK_NCCL(ncclGroupStart());
     for (size_t dev_id = 0; dev_id < global_gpu_count; dev_id++) {
@@ -174,8 +200,18 @@ class All2AllOutputDispatcher : public Dispatcher {
                        local_gpu->get_stream()));
     }  // for dev_id in global_gpu_count
     CK_NCCL(ncclGroupEnd());
+    cudaEventRecord(stop[local_replica_id], local_gpu->get_stream());
+    cudaEventSynchronize(stop[local_replica_id]);
+    gettimeofday(&end, 0);
+    cpu_time = (1000000.0 * (end.tv_sec - begin.tv_sec) + 
+                end.tv_usec - begin.tv_usec)/1000.0;
+    cudaEventElapsedTime(&gpu_time, start[local_replica_id], stop[local_replica_id]);
+    cpu_time_acc[local_replica_id][0] += cpu_time;
+    gpu_time_acc[local_replica_id][0] += gpu_time;
+    // end profile
 
     // step 2: reorder embedding values
+    gettimeofday(&begin, 0);
     {
       // CK_CUDA(cudaMemsetAsync(replica_output->GetPtrWithType<float>(), 0,
       //                         replica_output->get_size_in_bytes(),
@@ -185,6 +221,7 @@ class All2AllOutputDispatcher : public Dispatcher {
                                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       dim3 const grid_dim(2 * local_gpu->get_sm_count() / global_gpu_count, global_gpu_count);
       dim3 const block_dim(local_gpu->get_warp_size(), EMB_WARPS_PER_BLOCK);
+      cudaEventRecord(start[local_replica_id], local_gpu->get_stream());
       reorderKernel<ValueType><<<grid_dim, block_dim, smem_size, local_gpu->get_stream()>>>(
           /*EmbeddingDimension=*/embedding_vec_size,
           /*inputs=*/exchanged_embeddings_buf_[local_replica_id].get_ptr(),
@@ -193,7 +230,31 @@ class All2AllOutputDispatcher : public Dispatcher {
           /*chunks=*/global_gpu_count,
           /*max_chunk_size=*/num_keys_per_rank_,
           /*chunk_sizes=*/replica_num_selected_keys->GetPtrWithType<uint32_t>());
+      cudaEventRecord(stop[local_replica_id], local_gpu->get_stream());
+      cudaEventSynchronize(stop[local_replica_id]);
       CK_CUDA(cudaGetLastError());
+    }
+    gettimeofday(&end, 0);
+    cpu_time = (1000000.0 * (end.tv_sec - begin.tv_sec) + 
+                end.tv_usec - begin.tv_usec)/1000.0;
+    cudaEventElapsedTime(&gpu_time, start[local_replica_id], stop[local_replica_id]);
+    cpu_time_acc[local_replica_id][1] += cpu_time;
+    gpu_time_acc[local_replica_id][1] += gpu_time;
+    // end profile
+    // Profile Result
+    if (cnt[local_replica_id][0] == 100) {
+            auto session_name = []() {
+        std::cout << "forward: Output Dispatcher" << std::endl;
+      };
+      resource_mgr_->blocking_call_once(session_name);
+      for (int i = 0; i < 2; ++i) {
+        resource_mgr_->one_at_a_time(profile_time, local_replica_id, 1 + i, 
+                                                          cpu_time_acc[local_replica_id][i], 
+                                                          gpu_time_acc[local_replica_id][i]);       
+        cpu_time_acc[local_replica_id][i] = 0.;
+        gpu_time_acc[local_replica_id][i] = 0.;                                                         
+      }
+      cnt[local_replica_id][0] = 0;
     }
   }
 
@@ -214,7 +275,15 @@ class All2AllOutputDispatcher : public Dispatcher {
 
     auto &replica_input_grad = replica_context->output("replica_input_grad");
 
+    // Profile Session
+    timeval begin, end;
+    cudaEventCreate(&start[local_replica_id]);
+    cudaEventCreate(&stop[local_replica_id]);
+    float cpu_time, gpu_time;
+    cnt[local_replica_id][1]++;
+
     // step 1: gather top gradients for local GPU.
+    gettimeofday(&begin, 0);
     const size_t embedding_vec_size = base_context()->get_param()->get_embedding_vec_size();
     {
       const size_t smem_size = local_gpu->get_max_smem_size_per_sm() / 2;
@@ -222,6 +291,7 @@ class All2AllOutputDispatcher : public Dispatcher {
                                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       dim3 const grid_dim(2 * local_gpu->get_sm_count() / global_gpu_count, global_gpu_count);
       dim3 const block_dim(local_gpu->get_warp_size(), EMB_WARPS_PER_BLOCK);
+      cudaEventRecord(start[local_replica_id], local_gpu->get_stream());
       gatherExKernel<ValueType><<<grid_dim, block_dim, smem_size, local_gpu->get_stream()>>>(
           /*EmbeddingDimension=*/embedding_vec_size,
           /*inputs=*/replica_top_gradients->GetPtrWithType<ValueType>(),
@@ -230,10 +300,20 @@ class All2AllOutputDispatcher : public Dispatcher {
           /*chunks=*/global_gpu_count,
           /*max_chunk_size=*/num_keys_per_rank_,
           /*chunk_sizes=*/replica_num_selected_keys->GetPtrWithType<uint32_t>());
+      cudaEventRecord(stop[local_replica_id], local_gpu->get_stream());
+      cudaEventSynchronize(stop[local_replica_id]);
       CK_CUDA(cudaGetLastError());
     }
+    gettimeofday(&end, 0);
+    cpu_time = (1000000.0 * (end.tv_sec - begin.tv_sec) + 
+                end.tv_usec - begin.tv_usec)/1000.0;
+    cudaEventElapsedTime(&gpu_time, start[local_replica_id], stop[local_replica_id]);
+    cpu_time_acc[local_replica_id][2] += cpu_time;
+    gpu_time_acc[local_replica_id][2] += gpu_time;
 
     // step 2: exchange gradients among all GPUs.
+    gettimeofday(&end, 0);
+    cudaEventRecord(start[local_replica_id], local_gpu->get_stream());
     CK_NCCL(ncclGroupStart());
     for (size_t dev_id = 0; dev_id < global_gpu_count; dev_id++) {
       CK_NCCL(ncclSend(gathered_gradients_buf_[local_replica_id].get_ptr() +
@@ -249,6 +329,30 @@ class All2AllOutputDispatcher : public Dispatcher {
           local_gpu->get_stream()));
     }  // for dev_id in global_gpu_count
     CK_NCCL(ncclGroupEnd());
+    cudaEventRecord(stop[local_replica_id], local_gpu->get_stream());
+    cudaEventSynchronize(stop[local_replica_id]);
+    gettimeofday(&end, 0);
+    cpu_time = (1000000.0 * (end.tv_sec - begin.tv_sec) + 
+                end.tv_usec - begin.tv_usec)/1000.0;
+    cudaEventElapsedTime(&gpu_time, start[local_replica_id], stop[local_replica_id]);
+    cpu_time_acc[local_replica_id][3] += cpu_time;
+    gpu_time_acc[local_replica_id][3] += gpu_time;
+    
+    // Profile Result
+    if (cnt[local_replica_id][1] == 100) {
+            auto session_name = []() {
+        std::cout << "backward: Output Dispatcher" << std::endl;
+      };
+      resource_mgr_->blocking_call_once(session_name);
+      for (int i = 0; i < 2; ++i) {
+        resource_mgr_->one_at_a_time(profile_time, local_replica_id, 1 + i, 
+                                                          cpu_time_acc[local_replica_id][i + 2], 
+                                                          gpu_time_acc[local_replica_id][i + 2]);       
+        cpu_time_acc[local_replica_id][i + 2] = 0.;
+        gpu_time_acc[local_replica_id][i + 2] = 0.;                                                         
+      }
+      cnt[local_replica_id][1] = 0;
+    }
   }
 
  private:
@@ -260,6 +364,11 @@ class All2AllOutputDispatcher : public Dispatcher {
 
   // backward spaces
   Tensors2<ValueType> gathered_gradients_buf_;
+
+  // profile spaces
+  size_t cnt[4][2];
+  cudaEvent_t start[4], stop[4];
+  float cpu_time_acc[4][4], gpu_time_acc[4][4];
 };
 
 REGISTER_OUTPUT_DISPATHER_BUILDER("All2AllOutput", DataType::Int64, DataType::Float32,

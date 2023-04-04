@@ -14,10 +14,20 @@
  * limitations under the License.
  */
 
+
+#include <sys/time.h>
+#include <iomanip>
+#include <iostream>
 #include "common/include/forward_functions.h"
 #include "operation/operation_interface.h"
 
 namespace SparseOperationKit {
+
+static void profile_time(size_t id, int step, float cpu_time, float gpu_time) {
+  std::cout << "step " << step << ": CPU " 
+            << std::fixed << cpu_time / 100 << std::setprecision(9)
+            << "ms GPU "  << gpu_time / 100 << "ms" << std::endl; 
+}
 
 /*It will dispatcher keys based on key % GPU_NUM */
 template <typename KeyType, typename Hasher>
@@ -144,6 +154,15 @@ class All2AllInputDispatcher : public Dispatcher {
     if (ITEMS_PER_GPU_PER_WARP_ <= 33) {
       MESSAGE("[WARNING]: the performance in this device is not good enough..");
     }
+
+    // Profile Initialize
+    for (size_t i = 0; i < 4; ++i) {
+      cnt[i] = 0;
+      for (size_t j = 0; j < 5; ++j) {
+        cpu_time_acc[i][j] = 0.;
+        gpu_time_acc[i][j] = 0.;
+      }
+    }
   }
 
   void allocate_forward_spaces() override {
@@ -205,14 +224,36 @@ class All2AllInputDispatcher : public Dispatcher {
     const size_t local_replica_id = resource_mgr_->cal_local_id_from_global_id(global_replica_id);
     const auto &local_gpu = resource_mgr_->get_local_gpu(local_replica_id);
 
+    // Profile Session
+    // each thread call once
+    timeval begin, end;
+    cudaEventCreate(&start[local_replica_id]);
+    cudaEventCreate(&stop[local_replica_id]);
+    float cpu_time, gpu_time;
+    cnt[local_replica_id]++;
+
     // step 1: reset count spaces.
+    // start profile
+    gettimeofday(&begin, 0);
+    cudaEventRecord(start[local_replica_id], local_gpu->get_stream());
     CK_CUDA(cudaMemsetAsync(num_selected_keys_[local_replica_id].get_ptr(), 0,
                             num_selected_keys_[local_replica_id].get_size_in_bytes(),
                             local_gpu->get_stream()));
+    cudaEventRecord(stop[local_replica_id], local_gpu->get_stream());
     std::memset(h_recv_chunk_offsets_[local_replica_id].get_ptr(), 0,
                 h_recv_chunk_offsets_[local_replica_id].get_size_in_bytes());
+    cudaEventSynchronize(stop[local_replica_id]);
+    gettimeofday(&end, 0);
+    cpu_time = (1000000.0 * (end.tv_sec - begin.tv_sec) + 
+                end.tv_usec - begin.tv_usec)/1000.0;
+    cudaEventElapsedTime(&gpu_time, start[local_replica_id], stop[local_replica_id]);
+    cpu_time_acc[local_replica_id][0] += cpu_time;
+    gpu_time_acc[local_replica_id][0] += gpu_time;
+    // end profile
 
     // step 2: select keys for each GPU (rank)
+    // start profile
+    gettimeofday(&begin, 0);
     const auto &input_keys = replica_context->input("replica_values");
     {
       const size_t smem_size = local_gpu->get_max_smem_size_per_sm();
@@ -220,6 +261,7 @@ class All2AllInputDispatcher : public Dispatcher {
                                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       size_t const grid_dim = local_gpu->get_sm_count();
       dim3 const block_dim(local_gpu->get_warp_size(), KEY_WARPS_PER_BLOCK);
+      cudaEventRecord(start[local_replica_id], local_gpu->get_stream());
       selectKernel<KeyType, IdenticalHash>
           <<<grid_dim, block_dim, smem_size, local_gpu->get_stream()>>>(
               /*input_keys=*/input_keys->GetPtrWithType<KeyType>(),
@@ -229,10 +271,23 @@ class All2AllInputDispatcher : public Dispatcher {
               /*chunks=*/global_gpu_count, /*max_chunk_size=*/num_keys_per_rank_,
               /*chunk_sizes=*/num_selected_keys_[local_replica_id].get_ptr(),
               /*ITEMS_PER_GPU_PER_WARP=*/ITEMS_PER_GPU_PER_WARP_);
+      cudaEventRecord(stop[local_replica_id], local_gpu->get_stream());
+      cudaEventSynchronize(stop[local_replica_id]);
       CK_CUDA(cudaGetLastError());
     }
+    gettimeofday(&end, 0);
+    cpu_time = (1000000.0 * (end.tv_sec - begin.tv_sec) + 
+                end.tv_usec - begin.tv_usec)/1000.0;
+    cudaEventElapsedTime(&gpu_time, start[local_replica_id], stop[local_replica_id]);
+    cpu_time_acc[local_replica_id][1] += cpu_time;
+    gpu_time_acc[local_replica_id][1] += gpu_time;
+    // end profile
 
     // step 3: exchange selected keys count among all GPUs
+    // start profile
+    gettimeofday(&begin, 0);
+    cudaEventRecord(start[local_replica_id], local_gpu->get_stream());
+
     CK_NCCL(ncclGroupStart());
     for (size_t dev_id = 0; dev_id < global_gpu_count; dev_id++) {
       CK_NCCL(ncclSend(num_selected_keys_[local_replica_id].get_ptr() + dev_id, 1, ncclUint32,
@@ -242,7 +297,19 @@ class All2AllInputDispatcher : public Dispatcher {
     }  // for dev_id in global_gpu_count
     CK_NCCL(ncclGroupEnd());
 
+    cudaEventRecord(stop[local_replica_id], local_gpu->get_stream());
+    cudaEventSynchronize(stop[local_replica_id]);
+    gettimeofday(&end, 0);
+    cpu_time = (1000000.0 * (end.tv_sec - begin.tv_sec) + 
+                end.tv_usec - begin.tv_usec)/1000.0;
+    cudaEventElapsedTime(&gpu_time, start[local_replica_id], stop[local_replica_id]);
+    cpu_time_acc[local_replica_id][2] += cpu_time;
+    gpu_time_acc[local_replica_id][2] += gpu_time;
+    // end profile
+
     // step 4: copy count from GPU to CPU and calculate count offsets
+    // start profile
+    gettimeofday(&begin, 0);
     CK_CUDA(cudaMemcpyAsync(h_num_selected_keys_[local_replica_id].get_ptr(),
                             num_selected_keys_[local_replica_id].get_ptr(),
                             num_selected_keys_[local_replica_id].get_size_in_bytes(),
@@ -258,8 +325,18 @@ class All2AllInputDispatcher : public Dispatcher {
           h_recv_chunk_offsets_[local_replica_id].get_ptr()[dev_id] +
           h_num_exchanged_keys_[local_replica_id].get_ptr()[dev_id];
     }  // for dev_id in global_gpu_count
+    gettimeofday(&end, 0);
+    cpu_time = (1000000.0 * (end.tv_sec - begin.tv_sec) + 
+                end.tv_usec - begin.tv_usec)/1000.0;
+    cudaEventElapsedTime(&gpu_time, start[local_replica_id], stop[local_replica_id]);
+    cpu_time_acc[local_replica_id][3] += cpu_time;
+    // end profile
+
 
     // step 5: exchange selected keys among all GPUs
+    // start profile
+    gettimeofday(&begin, 0);
+    cudaEventRecord(start[local_replica_id], local_gpu->get_stream());
     CK_NCCL(ncclGroupStart());
     for (size_t dev_id = 0; dev_id < global_gpu_count; dev_id++) {
       CK_NCCL(ncclSend(selected_keys_buf_[local_replica_id].get_ptr() + dev_id * num_keys_per_rank_,
@@ -273,6 +350,31 @@ class All2AllInputDispatcher : public Dispatcher {
                        /*peer=*/dev_id, local_gpu->get_nccl(), local_gpu->get_stream()));
     }  // for dev_id in global_gpu_count
     CK_NCCL(ncclGroupEnd());
+    cudaEventRecord(stop[local_replica_id], local_gpu->get_stream());
+    cudaEventSynchronize(stop[local_replica_id]);
+    gettimeofday(&end, 0);
+    cpu_time = (1000000.0 * (end.tv_sec - begin.tv_sec) + 
+                end.tv_usec - begin.tv_usec)/1000.0;
+    cudaEventElapsedTime(&gpu_time, start[local_replica_id], stop[local_replica_id]);
+    cpu_time_acc[local_replica_id][4] += cpu_time;
+    gpu_time_acc[local_replica_id][4] += gpu_time;
+    // end profile
+
+    // Profile Result
+    if (cnt[local_replica_id] == 100) {
+      auto session_name = []() {
+        std::cout << "forward: Input Dispatcher" << std::endl;
+      };
+      resource_mgr_->blocking_call_once(session_name);
+      for (int i = 0; i < 5; ++i) {
+        resource_mgr_->one_at_a_time(profile_time, local_replica_id, i + 1, 
+                                                          cpu_time_acc[local_replica_id][i], 
+                                                          gpu_time_acc[local_replica_id][i]);
+        cpu_time_acc[local_replica_id][i] = 0.;
+        gpu_time_acc[local_replica_id][i] = 0.;
+      }
+      cnt[local_replica_id] = 0;
+    }
 
     // set output of this dispatcher
     replica_context->set_output("replica_exchanged_keys", exchanged_keys_buf_[local_replica_id]);
@@ -303,6 +405,11 @@ class All2AllInputDispatcher : public Dispatcher {
   Tensors2<uint32_t> h_num_exchanged_keys_;
   Tensors2<KeyType> exchanged_keys_buf_;
   Tensors2<uint32_t> h_recv_chunk_offsets_;
+
+  // profile spaces
+  size_t cnt[4];
+  float cpu_time_acc[4][5], gpu_time_acc[4][5];
+  cudaEvent_t start[4], stop[4];
 };
 
 REGISTER_INPUT_DISPATCHER_BUILDER("All2AllInput", DataType::Int64, DataType::Float32,
