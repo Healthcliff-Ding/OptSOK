@@ -103,9 +103,9 @@ __global__ void gatherExKernel(const size_t EmbeddingDimension, EmbeddingType co
 
 template <typename EmbeddingType>
 __global__ static void scatterGradKernel(const size_t EmbeddingDimension, EmbeddingType const *top_grad,
-                                  uint32_t const *top_indices, EmbeddingType **replica_grad, 
-                                  size_t chunks, size_t max_chunk_size, 
-                                  uint32_t const *top_select_size, uint32_t const *replica_recv_offset) {
+                                         uint32_t const *top_indices, EmbeddingType **replica_grad, 
+                                         size_t chunks, size_t max_chunk_size, 
+                                         uint32_t const *top_select_size, uint32_t const *replica_recv_offset) {
   uint32_t gpu_idx = blockIdx.y;
   uint32_t curr_chunk_size = top_select_size[gpu_idx];
   uint32_t const *curr_input_idx = top_indices + gpu_idx * max_chunk_size;
@@ -121,7 +121,27 @@ __global__ static void scatterGradKernel(const size_t EmbeddingDimension, Embedd
   }
 }
 
-template <typename ValueType>
+template <typename KeyType, typename Hasher, typename EmbeddingType>
+__global__ static void scatterGradKernel2(const size_t EmbeddingDimension, EmbeddingType const *top_grad,
+                                          KeyType const *input_keys, size_t num_keys,
+                                          uint32_t const *top_indices, EmbeddingType **replica_grad, 
+                                          size_t chunks, size_t max_chunk_size, 
+                                          uint32_t const *top_select_size, uint32_t const *replica_recv_offset) {
+
+  for (size_t id = blockIdx.x * blockDim.x + threadIdx.x; id < num_keys * EmbeddingDimension;
+       id += blockDim.x * gridDim.x) {
+    size_t item_id = id / EmbeddingDimension;
+    size_t embedding_id = id - item_id * EmbeddingDimension;
+
+    uint32_t gpu_idx = Hasher::compute(input_keys[item_id]) % chunks;
+    EmbeddingType *curr_output = replica_grad[gpu_idx] + replica_recv_offset[gpu_idx] * EmbeddingDimension;
+
+    size_t offset = top_indices[item_id];
+    curr_output[offset * EmbeddingDimension + embedding_id] = top_grad[id];
+  }
+}
+
+template <typename KeyType, typename ValueType>
 class All2AllOutputDispatcher : public Dispatcher {
  public:
   explicit All2AllOutputDispatcher(ConstructionContext_t context)
@@ -174,7 +194,9 @@ class All2AllOutputDispatcher : public Dispatcher {
     const auto &h_num_selected_keys = replica_context->input("replica_h_num_selected_keys");
     const auto &h_num_exchanged_keys = replica_context->input("replica_h_num_exchanged_keys");
 
+    const auto &input_keys = replica_context->input("replica_values");
     auto &replica_input_grad = replica_context->output("replica_input_grad");
+    auto &replica_key_offset_buf = replica_context->input("replica_key_offset_buf");
 
     const size_t embedding_vec_size = base_context()->get_param()->get_embedding_vec_size();
 
@@ -188,13 +210,30 @@ class All2AllOutputDispatcher : public Dispatcher {
         replica_h_recv_chunk_offsets->GetPtrWithType<uint32_t>()[dev_id];
     }
     resource_mgr_->sync_cpu_threads();
+    // //* WRITE style synchronize
+    // {
+    //   dim3 const grid_dim(2 * local_gpu->get_sm_count() / global_gpu_count, global_gpu_count);
+    //   scatterGradKernel<ValueType><<<grid_dim, 1024ul, 0, local_gpu->get_stream()>>>(
+    //     embedding_vec_size, 
+    //     replica_top_gradients->GetPtrWithType<ValueType>(),
+    //     replica_selected_indices_buf->GetPtrWithType<uint32_t>(),
+    //     h_replica_input_grad_ptr_[local_replica_id].get_ptr(),
+    //     global_gpu_count,
+    //     num_keys_per_rank_,
+    //     replica_num_selected_keys->GetPtrWithType<uint32_t>(),
+    //     h_replica_recv_chunk_offset_[local_replica_id].get_ptr());
+    //   CK_CUDA(cudaGetLastError());  
+    // }
+    // CK_CUDA(cudaStreamSynchronize(local_gpu->get_stream()));
+    // resource_mgr_->sync_cpu_threads();
     //* WRITE style synchronize
     {
-      dim3 const grid_dim(2 * local_gpu->get_sm_count() / global_gpu_count, global_gpu_count);
-      scatterGradKernel<ValueType><<<grid_dim, 1024ul, 0, local_gpu->get_stream()>>>(
+      scatterGradKernel2<KeyType, IdenticalHash, ValueType><<<local_gpu->get_sm_count() * 2, 1024ul, 0, local_gpu->get_stream()>>>(
         embedding_vec_size, 
         replica_top_gradients->GetPtrWithType<ValueType>(),
-        replica_selected_indices_buf->GetPtrWithType<uint32_t>(),
+        input_keys->GetPtrWithType<KeyType>(),
+        input_keys->get_num_elements(),
+        replica_key_offset_buf->GetPtrWithType<uint32_t>(),
         h_replica_input_grad_ptr_[local_replica_id].get_ptr(),
         global_gpu_count,
         num_keys_per_rank_,
@@ -218,12 +257,12 @@ class All2AllOutputDispatcher : public Dispatcher {
 };
 
 REGISTER_OUTPUT_DISPATHER_BUILDER("All2AllOutput", DataType::Int64, DataType::Float32,
-                                  All2AllOutputDispatcher<float>);
+                                  All2AllOutputDispatcher<int64_t, float>);
 REGISTER_OUTPUT_DISPATHER_BUILDER("All2AllOutput", DataType::Int64, DataType::Float16,
-                                  All2AllOutputDispatcher<__half>);
+                                  All2AllOutputDispatcher<int64_t, __half>);
 REGISTER_OUTPUT_DISPATHER_BUILDER("All2AllOutput", DataType::Uint32, DataType::Float32,
-                                  All2AllOutputDispatcher<float>);
+                                  All2AllOutputDispatcher<uint32_t, float>);
 REGISTER_OUTPUT_DISPATHER_BUILDER("All2AllOutput", DataType::Uint32, DataType::Float16,
-                                  All2AllOutputDispatcher<__half>);
+                                  All2AllOutputDispatcher<uint32_t, __half>);
 
 }  // namespace SparseOperationKit
